@@ -8,7 +8,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
       PYTHONUNBUFFERED: "1"
@@ -29,8 +29,12 @@ jobs:
 
       - name: Harvest 21st.dev components
         id: harvest
+        # --no-update-prompts keeps nightly runs incremental: only truly new
+        # components are fetched. To force-refresh prompts on existing records
+        # (e.g., after a template tweak), run locally without the flag or
+        # trigger a dedicated refresh workflow.
         run: |
-          python pipeline/harvest_21st.py | tee harvest.log
+          python pipeline/harvest_21st.py --no-update-prompts | tee harvest.log
 
       - name: Detect new components
         id: detect
