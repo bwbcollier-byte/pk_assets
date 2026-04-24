@@ -60,12 +60,16 @@ GEMINI_MODEL = "gemini-2.5-flash"
 # Multiple OpenRouter free models rotated round-robin per request. Each model
 # has its own quota pool, so cycling multiplies effective free-tier capacity.
 # Override with OPENROUTER_MODELS (comma-separated) or OPENROUTER_MODEL (single).
+# Verified against https://openrouter.ai/api/v1/models — all currently
+# present as :free variants. Different providers, different quota pools.
 _default_openrouter_models = ",".join([
-    "deepseek/deepseek-chat:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-    "google/gemini-2.0-flash-exp:free",
-    "tencent/hunyuan-a13b-instruct:free",
+    "qwen/qwen3-coder:free",
+    "openai/gpt-oss-120b:free",
+    "z-ai/glm-4.5-air:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
     "meta-llama/llama-3.3-70b-instruct:free",
+    "tencent/hy3-preview:free",
+    "google/gemma-3-27b-it:free",
 ])
 OPENROUTER_MODELS = [
     m.strip()
