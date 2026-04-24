@@ -58,6 +58,24 @@ UA = "pk_assets harvest_21st.py / +https://github.com/bwbcollier-byte/pk_assets"
 
 SKIP_FIRST_SEGMENT = {"popular", "newest", "featured", "week", "s"}
 
+# Airtable long-text fields cap at 100,000 chars. Leave headroom.
+MAX_TEXT_CHARS = 95_000
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= MAX_TEXT_CHARS:
+        return text
+    # Prefer a clean newline cut, but fall back to a hard cut if the source
+    # is one giant line (e.g. minified files).
+    cut = text.rfind("\n", 0, MAX_TEXT_CHARS - 200)
+    if cut < MAX_TEXT_CHARS - 5_000:
+        cut = MAX_TEXT_CHARS - 200
+    return (
+        text[:cut]
+        + f"\n\n// --- truncated at {cut} chars of {len(text)} total ---\n"
+        "// Full source available at this record's Source URL.\n"
+    )
+
 
 def pat() -> str:
     token = os.environ.get("AIRTABLE_PAT")
@@ -272,11 +290,13 @@ def build_stub(author: str, slug: str, registry: dict, prompt_text: str, demo: s
     for d in deps:
         tag_words.append(d.lower())
 
+    safe_code = _truncate(code)
+    safe_prompt = _truncate(prompt_text)
     return {
         "fields": {
             F_NAME: display,
-            F_CODE_REACT: code,
-            F_PROMPT_TEXT: prompt_text,
+            F_CODE_REACT: safe_code,
+            F_PROMPT_TEXT: safe_prompt,
             F_TOKEN_ESTIMATE: max(1, len(code) // 4),
             F_TAGS: ", ".join(dict.fromkeys(tag_words)),
             F_FRAMEWORK: ["React", "Tailwind"],
@@ -395,7 +415,7 @@ def main(argv: list[str]) -> int:
 
             if is_existing:
                 updates.append(
-                    {"id": known[source_url], "fields": {F_PROMPT_TEXT: prompt_text}}
+                    {"id": known[source_url], "fields": {F_PROMPT_TEXT: _truncate(prompt_text)}}
                 )
             else:
                 stub = build_stub(author, slug, registry, prompt_text, demo)
