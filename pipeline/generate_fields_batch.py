@@ -82,7 +82,7 @@ Respond with raw JSON only, no prose, no markdown fences."""
 
 # --- HTTP helper ------------------------------------------------------------
 
-def http(method: str, url: str, headers: dict, body: dict | None = None, timeout: int = 60) -> tuple[int, dict]:
+def http(method: str, url: str, headers: dict, body: dict | None = None, timeout: int = 180) -> tuple[int, dict]:
     data = None
     h = {"Content-Type": "application/json", **headers}
     if body is not None:
@@ -284,6 +284,11 @@ def _try_provider(pool: KeyPool, caller, code: str, name: str, max_soft_fails: i
             if any(s in msg for s in RATE_STATUSES):
                 time.sleep(1.5)
                 continue
+            if "timed out" in msg.lower() or "timeout" in msg.lower():
+                # Timeout means the model is probably struggling with this
+                # specific input — switching keys won't help, try next provider.
+                print(f"[{pool.label}] {name}: timeout, falling back", file=sys.stderr)
+                return None
             # Soft error (parse failure, malformed body, unclassified). Usually
             # an input problem — rotating to another key in the same provider
             # won't help, so bail after a small budget.
