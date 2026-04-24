@@ -372,6 +372,7 @@ def run_realtime() -> int:
     print(f"{total} candidates for generation")
     log_path = Path("generation_log.jsonl")
     succeeded = failed = 0
+    consecutive_fails = 0  # provider-outage circuit breaker
     with log_path.open("a", encoding="utf-8") as log:
         for i, rec in enumerate(candidates, 1):
             fields = rec.get("fields", {})
@@ -382,10 +383,23 @@ def run_realtime() -> int:
             parsed = generate_one(gemini, openrouter, code, name)
             if parsed is None:
                 failed += 1
+                consecutive_fails += 1
                 log.write(json.dumps({"record_id": rec["id"], "name": name, "error": "all providers exhausted"}) + "\n")
                 log.flush()
                 print(f"[{i}/{total}] FAIL {name}", file=sys.stderr)
+                # If both providers are sustained-unavailable, stop burning
+                # attempts on every record and back off. 300s buys the free
+                # tiers time to recover; subsequent successes reset the counter.
+                if consecutive_fails >= 5:
+                    print(
+                        f"  ! {consecutive_fails} consecutive failures — backing off 5 min "
+                        f"before continuing. (Upstream providers likely degraded.)",
+                        file=sys.stderr,
+                    )
+                    time.sleep(300)
+                    consecutive_fails = 0
                 continue
+            consecutive_fails = 0
             update_record(rec["id"], parsed)
             succeeded += 1
             log.write(json.dumps({"record_id": rec["id"], "name": name, "parsed": parsed}) + "\n")
