@@ -58,7 +58,7 @@ OPENROUTER_RECORD_ID = "recWh4W2XOf2TfZAn"
 
 GEMINI_MODEL = "gemini-2.5-flash"
 OPENROUTER_MODEL = os.environ.get(
-    "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
+    "OPENROUTER_MODEL", "deepseek/deepseek-chat-v3.1:free"
 )
 
 SYSTEM_PROMPT = """You generate marketplace assets for a UI component library.
@@ -268,34 +268,41 @@ RATE_STATUSES = ("429", "503", "529")
 def _try_provider(pool: KeyPool, caller, code: str, name: str, max_soft_fails: int = 2) -> dict | None:
     """Try each key in the pool until success, rate-limit backoff, or soft-fail budget."""
     soft_fails = 0
-    for _ in range(len(pool.keys)):
+    rate_limited = 0
+    # Allow a few extra rotations so rate-limited keys get a second chance after backoff.
+    max_iters = max(len(pool.keys) * 2, 1)
+    last_err: str | None = None
+    for _ in range(max_iters):
         if pool.alive() == 0:
+            print(f"[{pool.label}] {name}: all keys dead ({last_err})", file=sys.stderr)
             return None
         key = pool.next()
         if key is None:
-            return None
+            break
         try:
             return caller(key, code, name)
         except Exception as e:
             msg = str(e)
+            last_err = msg[:200]
             if any(s in msg for s in FATAL_STATUSES):
                 pool.kill(key, msg[:80])
                 continue
             if any(s in msg for s in RATE_STATUSES):
-                time.sleep(1.5)
+                rate_limited += 1
+                # Longer backoff as we rotate — 1.5s, 3s, 6s, ...
+                time.sleep(min(1.5 * (2 ** min(rate_limited - 1, 4)), 30))
                 continue
             if "timed out" in msg.lower() or "timeout" in msg.lower():
-                # Timeout means the model is probably struggling with this
-                # specific input — switching keys won't help, try next provider.
                 print(f"[{pool.label}] {name}: timeout, falling back", file=sys.stderr)
                 return None
-            # Soft error (parse failure, malformed body, unclassified). Usually
-            # an input problem — rotating to another key in the same provider
-            # won't help, so bail after a small budget.
             soft_fails += 1
             print(f"[{pool.label}] {name}: {msg[:200]}", file=sys.stderr)
             if soft_fails >= max_soft_fails:
                 return None
+    if rate_limited:
+        print(f"[{pool.label}] {name}: exhausted after {rate_limited} rate-limit hits ({last_err})", file=sys.stderr)
+    elif last_err:
+        print(f"[{pool.label}] {name}: exhausted ({last_err})", file=sys.stderr)
     return None
 
 
