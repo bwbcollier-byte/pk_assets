@@ -358,11 +358,12 @@ def run_realtime() -> int:
     openrouter = KeyPool("openrouter", openrouter_keys)
 
     candidates = list_candidates()
-    print(f"{len(candidates)} candidates for generation")
+    total = len(candidates)
+    print(f"{total} candidates for generation")
     log_path = Path("generation_log.jsonl")
     succeeded = failed = 0
     with log_path.open("a", encoding="utf-8") as log:
-        for rec in candidates:
+        for i, rec in enumerate(candidates, 1):
             fields = rec.get("fields", {})
             name = fields.get("Name") or ""
             code = fields.get("Code React") or ""
@@ -372,12 +373,14 @@ def run_realtime() -> int:
             if parsed is None:
                 failed += 1
                 log.write(json.dumps({"record_id": rec["id"], "name": name, "error": "all providers exhausted"}) + "\n")
-                print(f"FAIL {name}", file=sys.stderr)
+                log.flush()
+                print(f"[{i}/{total}] FAIL {name}", file=sys.stderr)
                 continue
             update_record(rec["id"], parsed)
             succeeded += 1
             log.write(json.dumps({"record_id": rec["id"], "name": name, "parsed": parsed}) + "\n")
-            print(f"ok  {name}")
+            log.flush()
+            print(f"[{i}/{total}] ok   {name}")
     print(f"done: {succeeded} succeeded, {failed} failed. log: {log_path}")
     return 0 if failed == 0 else 2
 

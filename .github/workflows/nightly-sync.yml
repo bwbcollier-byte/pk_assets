@@ -11,6 +11,7 @@ jobs:
     timeout-minutes: 30
     env:
       AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
+      PYTHONUNBUFFERED: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
