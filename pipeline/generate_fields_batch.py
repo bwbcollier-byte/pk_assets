@@ -199,7 +199,7 @@ def call_gemini(key: str, code: str, name: str) -> dict:
         "generationConfig": {
             "responseMimeType": "application/json",
             "temperature": 0.4,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 8192,
         },
     }
     status, payload = http("POST", url, {}, body)
@@ -208,10 +208,15 @@ def call_gemini(key: str, code: str, name: str) -> dict:
         raise RuntimeError(f"gemini {status}: {err}")
     candidates = payload.get("candidates") or []
     if not candidates:
-        raise RuntimeError(f"gemini empty: {json.dumps(payload)[:200]}")
+        block = payload.get("promptFeedback", {}).get("blockReason")
+        raise RuntimeError(f"gemini empty (blockReason={block}): {json.dumps(payload)[:200]}")
+    finish = candidates[0].get("finishReason", "?")
     parts = candidates[0].get("content", {}).get("parts", [])
     text = "".join(p.get("text", "") for p in parts)
-    return _extract_json(text)
+    try:
+        return _extract_json(text)
+    except Exception as e:
+        raise RuntimeError(f"gemini parse fail (finish={finish}, len={len(text)}): {text[:160]!r}") from e
 
 
 def call_openrouter(key: str, code: str, name: str) -> dict:
@@ -250,39 +255,40 @@ FATAL_STATUSES = ("401", "403")
 RATE_STATUSES = ("429", "503", "529")
 
 
-def generate_one(gemini: KeyPool, openrouter: KeyPool, code: str, name: str) -> dict | None:
-    attempts = 0
-    max_attempts = gemini.alive() + openrouter.alive()
-    while attempts < max_attempts:
-        attempts += 1
-        key = gemini.next()
-        if key:
-            try:
-                return call_gemini(key, code, name)
-            except Exception as e:
-                msg = str(e)
-                if any(code_ in msg for code_ in FATAL_STATUSES):
-                    gemini.kill(key, msg[:80])
-                elif any(code_ in msg for code_ in RATE_STATUSES):
-                    time.sleep(1.5)
-                else:
-                    print(f"[gemini] {name}: {msg[:120]}", file=sys.stderr)
+def _try_provider(pool: KeyPool, caller, code: str, name: str, max_soft_fails: int = 2) -> dict | None:
+    """Try each key in the pool until success, rate-limit backoff, or soft-fail budget."""
+    soft_fails = 0
+    for _ in range(len(pool.keys)):
+        if pool.alive() == 0:
+            return None
+        key = pool.next()
+        if key is None:
+            return None
+        try:
+            return caller(key, code, name)
+        except Exception as e:
+            msg = str(e)
+            if any(s in msg for s in FATAL_STATUSES):
+                pool.kill(key, msg[:80])
                 continue
-        key = openrouter.next()
-        if key:
-            try:
-                return call_openrouter(key, code, name)
-            except Exception as e:
-                msg = str(e)
-                if any(code_ in msg for code_ in FATAL_STATUSES):
-                    openrouter.kill(key, msg[:80])
-                elif any(code_ in msg for code_ in RATE_STATUSES):
-                    time.sleep(1.5)
-                else:
-                    print(f"[openrouter] {name}: {msg[:120]}", file=sys.stderr)
+            if any(s in msg for s in RATE_STATUSES):
+                time.sleep(1.5)
                 continue
-        break
+            # Soft error (parse failure, malformed body, unclassified). Usually
+            # an input problem — rotating to another key in the same provider
+            # won't help, so bail after a small budget.
+            soft_fails += 1
+            print(f"[{pool.label}] {name}: {msg[:200]}", file=sys.stderr)
+            if soft_fails >= max_soft_fails:
+                return None
     return None
+
+
+def generate_one(gemini: KeyPool, openrouter: KeyPool, code: str, name: str) -> dict | None:
+    result = _try_provider(gemini, call_gemini, code, name)
+    if result is not None:
+        return result
+    return _try_provider(openrouter, call_openrouter, code, name)
 
 
 # --- Airtable I/O -----------------------------------------------------------
