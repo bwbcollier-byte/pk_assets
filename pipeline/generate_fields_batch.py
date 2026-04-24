@@ -57,9 +57,26 @@ OPENROUTER_RECORD_ID = "recWh4W2XOf2TfZAn"
 # --- Model config -----------------------------------------------------------
 
 GEMINI_MODEL = "gemini-2.5-flash"
-OPENROUTER_MODEL = os.environ.get(
-    "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
-)
+# Multiple OpenRouter free models rotated round-robin per request. Each model
+# has its own quota pool, so cycling multiplies effective free-tier capacity.
+# Override with OPENROUTER_MODELS (comma-separated) or OPENROUTER_MODEL (single).
+_default_openrouter_models = ",".join([
+    "deepseek/deepseek-chat:free",
+    "qwen/qwen-2.5-72b-instruct:free",
+    "google/gemini-2.0-flash-exp:free",
+    "tencent/hunyuan-a13b-instruct:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+])
+OPENROUTER_MODELS = [
+    m.strip()
+    for m in (
+        os.environ.get("OPENROUTER_MODELS")
+        or os.environ.get("OPENROUTER_MODEL")
+        or _default_openrouter_models
+    ).split(",")
+    if m.strip()
+]
+_openrouter_model_counter = 0
 
 SYSTEM_PROMPT = """You generate marketplace assets for a UI component library.
 
@@ -226,9 +243,17 @@ def call_gemini(key: str, code: str, name: str) -> dict:
         raise RuntimeError(f"gemini parse fail (finish={finish}, len={len(text)}): {text[:160]!r}") from e
 
 
+def _next_openrouter_model() -> str:
+    global _openrouter_model_counter
+    model = OPENROUTER_MODELS[_openrouter_model_counter % len(OPENROUTER_MODELS)]
+    _openrouter_model_counter += 1
+    return model
+
+
 def call_openrouter(key: str, code: str, name: str) -> dict:
+    model = _next_openrouter_model()
     body = {
-        "model": OPENROUTER_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -248,10 +273,10 @@ def call_openrouter(key: str, code: str, name: str) -> dict:
     status, payload = http("POST", "https://openrouter.ai/api/v1/chat/completions", headers, body)
     if status != 200:
         err = json.dumps(payload)[:200]
-        raise RuntimeError(f"openrouter {status}: {err}")
+        raise RuntimeError(f"openrouter {status} ({model}): {err}")
     choices = payload.get("choices") or []
     if not choices:
-        raise RuntimeError(f"openrouter empty: {json.dumps(payload)[:200]}")
+        raise RuntimeError(f"openrouter empty ({model}): {json.dumps(payload)[:200]}")
     text = choices[0].get("message", {}).get("content", "")
     return _extract_json(text)
 
@@ -360,7 +385,10 @@ def update_record(record_id: str, parsed: dict) -> None:
 def run_realtime() -> int:
     gemini_keys = fetch_keys(GEMINI_RECORD_ID, GEMINI_KEY_RE)
     openrouter_keys = fetch_keys(OPENROUTER_RECORD_ID, OPENROUTER_KEY_RE)
-    print(f"gemini keys: {len(gemini_keys)}  |  openrouter keys: {len(openrouter_keys)}")
+    print(
+        f"gemini keys: {len(gemini_keys)}  |  openrouter keys: {len(openrouter_keys)}  |  "
+        f"openrouter models: {len(OPENROUTER_MODELS)} ({', '.join(OPENROUTER_MODELS)})"
+    )
     if not gemini_keys and not openrouter_keys:
         sys.exit("no usable keys found in Airtable Logins & Keys")
 
