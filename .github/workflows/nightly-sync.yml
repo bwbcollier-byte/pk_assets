@@ -27,6 +27,11 @@ jobs:
           git clone --depth 1 https://github.com/magicuidesign/magicui.git repos/magicui
           git clone --depth 1 https://github.com/markmead/hyperui.git repos/hyperui
 
+      - name: Harvest 21st.dev components
+        id: harvest
+        run: |
+          python pipeline/harvest_21st.py | tee harvest.log
+
       - name: Detect new components
         id: detect
         run: |
@@ -56,6 +61,10 @@ jobs:
           {
             echo "## Nightly sync results"
             echo
+            echo "### harvest_21st"
+            echo '```'
+            tail -n 20 harvest.log 2>/dev/null || echo "no log"
+            echo '```'
             echo "### detect_new_components"
             echo '```'
             tail -n 20 detect.log 2>/dev/null || echo "no log"

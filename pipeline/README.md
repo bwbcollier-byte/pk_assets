@@ -39,6 +39,7 @@ upstream repos ──clone──▶ repos/<library>/...
 
 | Script | Purpose |
 |---|---|
+| `harvest_21st.py` | Walks [21st.dev's sitemap](https://21st.dev/sitemap.xml), filters to two-segment `/community/components/<author>/<name>` URLs, fetches each component's public shadcn registry JSON at `/r/<author>/<name>`, and upserts a Draft Airtable record. Keyed on Source URL for safe re-runs. Category left as `Components` — 21st.dev's taxonomy isn't in the registry JSON, and a later Gemini pass will classify by code content. Flags: `--limit N`, `--dry-run`. |
 | `detect_new_components.py` | Walks `repos/` and creates Airtable stubs for components that don't exist yet. Sets defaults: Framework `[React, Tailwind]`, Category `Components`, Style `Dark UI`, Tier `Free`, Published `Draft`, Source `Scraped`, Source URL, and Tags from the filename. |
 | `push_code_to_airtable.py` | Reads source files under `repos/` and patches `Code React` + `Token Estimate` on matching records. Skips records that already have code. Matching is kebab-case filename → `Title Case (Library Name)` in Airtable, with a short override list for ambiguous cases. |
 | `generate_fields_batch.py` | For records with code but thin copy, asks **Gemini 2.5 Flash** (free tier) for a JSON blob with `description`, `prompt_text`, and `code_html`. Falls back to **OpenRouter free models** (default `meta-llama/llama-3.3-70b-instruct:free`) when Gemini keys are exhausted. Both providers use key pools rotated round-robin per request, pulled from the Airtable Logins & Keys base at runtime so upstream key rotations don't require a redeploy. Supports `realtime` (default) and `apply <results.jsonl>` (re-patch Airtable from a saved log). |
@@ -69,8 +70,9 @@ Override the OpenRouter fallback model with `OPENROUTER_MODEL=...:free`.
 ## Run order
 
 ```bash
-python pipeline/detect_new_components.py   # create stubs for new files
-python pipeline/push_code_to_airtable.py   # fill in source code
+python pipeline/harvest_21st.py            # pull 21st.dev via sitemap + registry
+python pipeline/detect_new_components.py   # stubs for newly cloned repo files
+python pipeline/push_code_to_airtable.py   # fill source on matching stubs
 python pipeline/generate_fields_batch.py   # Gemini → OpenRouter fallback
 ```
 
@@ -105,6 +107,7 @@ for a Claude Code pass later.
 |---|---|---|
 | Magic UI | ✅ | 76 `.tsx` files under `apps/www/registry/magicui` |
 | HyperUI | ✅ | HTML snippets under `src/components` |
+| 21st.dev | ✅ | ~1,050 components via public shadcn registry (`/r/<author>/<name>`) |
 | Aceternity UI | ❌ | No public source repo — needs hand-authored prompts |
 | daisyUI | N/A | CSS-only library; components are Tailwind class lists, not files |
 
