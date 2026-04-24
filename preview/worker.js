@@ -26,11 +26,16 @@ export default {
       return html(errorPage("Bad record ID", recordId), 400);
     }
 
+    const pat = (env.AIRTABLE_PAT || "").trim();
+    if (!pat) {
+      return html(errorPage("AIRTABLE_PAT secret is not set", "Run: wrangler secret put AIRTABLE_PAT"), 500);
+    }
+
     const apiUrl = `https://api.airtable.com/v0/${BASE_ID}/${TABLE_ID}/${recordId}`;
     let resp;
     try {
       resp = await fetch(apiUrl, {
-        headers: { Authorization: `Bearer ${env.AIRTABLE_PAT}` },
+        headers: { Authorization: `Bearer ${pat}` },
       });
     } catch (e) {
       return html(errorPage("Network error reaching Airtable", String(e)), 502);
