@@ -67,7 +67,11 @@ def pat() -> str:
 
 
 def http_get(url: str, headers: dict | None = None) -> tuple[int, bytes]:
-    req = request.Request(url, headers={"User-Agent": UA, **(headers or {})})
+    try:
+        req = request.Request(url, headers={"User-Agent": UA, **(headers or {})})
+    except Exception:
+        # Malformed URL — caller treats 0 as a skip.
+        return 0, b""
     for attempt in range(4):
         try:
             with request.urlopen(req, timeout=45) as resp:
@@ -80,6 +84,9 @@ def http_get(url: str, headers: dict | None = None) -> tuple[int, bytes]:
         except error.URLError:
             time.sleep(1 + attempt)
             continue
+        except Exception:
+            # Catches http.client.InvalidURL and other connection-level oddities.
+            return 0, b""
     return 0, b""
 
 
@@ -125,7 +132,11 @@ def enumerate_components() -> list[tuple[str, str]]:
             continue
         if len(parts) != 2:
             continue
-        key = (parts[0], parts[1])
+        # Decode so we work with raw author/slug strings internally — we
+        # re-encode when building URLs and the Source URL field value.
+        author = parse.unquote(parts[0])
+        slug = parse.unquote(parts[1])
+        key = (author, slug)
         if key in seen:
             continue
         seen.add(key)
@@ -133,8 +144,12 @@ def enumerate_components() -> list[tuple[str, str]]:
     return out
 
 
+def _enc(segment: str) -> str:
+    return parse.quote(segment, safe="")
+
+
 def fetch_registry(author: str, slug: str) -> dict | None:
-    status, body = http_get(f"https://21st.dev/r/{author}/{slug}")
+    status, body = http_get(f"https://21st.dev/r/{_enc(author)}/{_enc(slug)}")
     if status != 200:
         return None
     try:
@@ -148,7 +163,7 @@ def fetch_registry(author: str, slug: str) -> dict | None:
 
 def fetch_demo(author: str, slug: str) -> str | None:
     status, body = http_get(
-        f"https://cdn.21st.dev/user_{author}/{slug}.demo.tsx"
+        f"https://cdn.21st.dev/user_{_enc(author)}/{_enc(slug)}.demo.tsx"
     )
     if status != 200 or not body:
         return None
@@ -248,7 +263,7 @@ def build_stub(author: str, slug: str, registry: dict, prompt_text: str, demo: s
 
     deps = registry.get("dependencies") or []
     display = f"{title_case(slug)} (21st.dev)"
-    source_url = f"https://21st.dev/community/components/{author}/{slug}"
+    source_url = f"https://21st.dev/community/components/{_enc(author)}/{_enc(slug)}"
 
     tag_words = [author.lower()]
     for token in re.split(r"[-_]", slug):
@@ -354,44 +369,65 @@ def main(argv: list[str]) -> int:
     stubs: list[dict] = []
     updates: list[dict] = []
     fetch_failed = empty_registry = touched = 0
+    ok_new_total = fail_new_total = ok_upd_total = fail_upd_total = 0
+    FLUSH_EVERY = 50
 
     for idx, (author, slug) in enumerate(components, 1):
         if args.limit and touched >= args.limit:
             break
-        source_url = f"https://21st.dev/community/components/{author}/{slug}"
-        is_existing = source_url in known
-        if is_existing and args.no_update_prompts:
-            continue
+        try:
+            source_url = f"https://21st.dev/community/components/{_enc(author)}/{_enc(slug)}"
+            is_existing = source_url in known
+            if is_existing and args.no_update_prompts:
+                continue
 
-        registry = fetch_registry(author, slug)
-        if registry is None:
-            fetch_failed += 1
-            print(f"[{idx}/{len(components)}] fetch fail {author}/{slug}", file=sys.stderr)
-            time.sleep(0.15)
-            continue
+            registry = fetch_registry(author, slug)
+            if registry is None:
+                fetch_failed += 1
+                print(f"[{idx}/{len(components)}] fetch fail {author}/{slug}", file=sys.stderr)
+                time.sleep(0.15)
+                continue
 
-        prompt_text, _demo = assemble_prompt(author, slug, registry)
-        if not prompt_text:
-            empty_registry += 1
-            continue
-
-        if is_existing:
-            updates.append(
-                {"id": known[source_url], "fields": {F_PROMPT_TEXT: prompt_text}}
-            )
-        else:
-            stub = build_stub(author, slug, registry, prompt_text, _demo)
-            if not stub:
+            prompt_text, demo = assemble_prompt(author, slug, registry)
+            if not prompt_text:
                 empty_registry += 1
                 continue
-            stubs.append(stub)
 
-        touched += 1
-        if touched % 25 == 0:
-            print(
-                f"[{idx}/{len(components)}] staged new={len(stubs)} updates={len(updates)}",
-                flush=True,
-            )
+            if is_existing:
+                updates.append(
+                    {"id": known[source_url], "fields": {F_PROMPT_TEXT: prompt_text}}
+                )
+            else:
+                stub = build_stub(author, slug, registry, prompt_text, demo)
+                if not stub:
+                    empty_registry += 1
+                    continue
+                stubs.append(stub)
+
+            touched += 1
+            if touched % 25 == 0:
+                print(
+                    f"[{idx}/{len(components)}] staged new={len(stubs)} updates={len(updates)}",
+                    flush=True,
+                )
+            if not args.dry_run and (len(stubs) >= FLUSH_EVERY or len(updates) >= FLUSH_EVERY):
+                if stubs:
+                    ok_n, fail_n = create_records(stubs)
+                    ok_new_total += ok_n
+                    fail_new_total += fail_n
+                    stubs = []
+                if updates:
+                    ok_u, fail_u = patch_records(updates)
+                    ok_upd_total += ok_u
+                    fail_upd_total += fail_u
+                    updates = []
+                print(
+                    f"[{idx}/{len(components)}] flushed — created={ok_new_total} updated={ok_upd_total}",
+                    flush=True,
+                )
+        except Exception as e:
+            fetch_failed += 1
+            print(f"[{idx}/{len(components)}] error {author}/{slug}: {e}", file=sys.stderr)
         time.sleep(0.15)
 
     print(
@@ -408,13 +444,21 @@ def main(argv: list[str]) -> int:
             print("UPDATE", u["id"])
         return 0
 
-    ok_new, fail_new = create_records(stubs) if stubs else (0, 0)
-    ok_upd, fail_upd = patch_records(updates) if updates else (0, 0)
+    # Final flush for whatever is left after the last increment.
+    if stubs:
+        ok_n, fail_n = create_records(stubs)
+        ok_new_total += ok_n
+        fail_new_total += fail_n
+    if updates:
+        ok_u, fail_u = patch_records(updates)
+        ok_upd_total += ok_u
+        fail_upd_total += fail_u
+
+    total_fail = fail_new_total + fail_upd_total
     print(
-        f"airtable: created={ok_new}/{len(stubs)} updated={ok_upd}/{len(updates)} "
-        f"failed={fail_new + fail_upd}"
+        f"airtable: created={ok_new_total} updated={ok_upd_total} failed={total_fail}"
     )
-    return 0 if (fail_new + fail_upd) == 0 else 2
+    return 0 if total_fail == 0 else 2
 
 
 if __name__ == "__main__":
