@@ -1,0 +1,63 @@
+name: Nightly Component Sync
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Clone upstream component repos
+        run: |
+          mkdir -p repos
+          git clone --depth 1 https://github.com/magicuidesign/magicui.git repos/magicui
+          git clone --depth 1 https://github.com/markmead/hyperui.git repos/hyperui
+
+      - name: Detect new components
+        id: detect
+        run: |
+          python pipeline/detect_new_components.py | tee detect.log
+
+      - name: Push source code to Airtable
+        id: push
+        run: |
+          python pipeline/push_code_to_airtable.py | tee push.log
+
+      - name: Generate marketplace copy (realtime)
+        id: generate
+        run: |
+          python pipeline/generate_fields_batch.py realtime | tee generate.log
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Nightly sync results"
+            echo
+            echo "### detect_new_components"
+            echo '```'
+            tail -n 20 detect.log 2>/dev/null || echo "no log"
+            echo '```'
+            echo "### push_code_to_airtable"
+            echo '```'
+            tail -n 20 push.log 2>/dev/null || echo "no log"
+            echo '```'
+            echo "### generate_fields_batch"
+            echo '```'
+            tail -n 20 generate.log 2>/dev/null || echo "no log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
