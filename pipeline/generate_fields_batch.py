@@ -68,14 +68,12 @@ Given a component's source code, return a JSON object with exactly these keys:
   "description"  — 2–3 sentence marketplace copy describing what the component
                    does and where a buyer would use it. Do NOT mention the
                    source library by name.
-  "prompt_text"  — A detailed prompt a developer could hand to an LLM to
-                   reproduce the component. Include the props interface, key
-                   Tailwind CSS classes, any animation keyframes, and the
-                   behavior expected. This is the actual product — be specific.
   "code_html"    — A standalone HTML version styled with Tailwind CDN that
                    visually matches the original. Include a <style> block for
                    any custom keyframes or effects. No <html> or <body> wrapper
                    is required — just the component fragment and its styles.
+
+The Prompt Text field is NOT your job — it's templated deterministically.
 
 Respond with raw JSON only, no prose, no markdown fences."""
 
@@ -202,11 +200,10 @@ def call_gemini(key: str, code: str, name: str) -> dict:
                 "type": "object",
                 "properties": {
                     "description": {"type": "string"},
-                    "prompt_text": {"type": "string"},
                     "code_html": {"type": "string"},
                 },
-                "required": ["description", "prompt_text", "code_html"],
-                "propertyOrdering": ["description", "prompt_text", "code_html"],
+                "required": ["description", "code_html"],
+                "propertyOrdering": ["description", "code_html"],
             },
             "temperature": 0.4,
             "maxOutputTokens": 16384,
@@ -316,10 +313,12 @@ def generate_one(gemini: KeyPool, openrouter: KeyPool, code: str, name: str) -> 
 # --- Airtable I/O -----------------------------------------------------------
 
 def list_candidates() -> list[dict]:
+    # Prompt Text is now templated by harvest_21st / detect_new_components.
+    # Gemini only needs to fill Description and Code HTML.
     formula = (
         "AND("
         "LEN({Code React})>50,"
-        "OR(LEN({Description})<100,LEN({Prompt Text})=0)"
+        "OR(LEN({Description})<100,LEN({Code HTML})<100)"
         ")"
     )
     records: list[dict] = []
@@ -343,7 +342,6 @@ def list_candidates() -> list[dict]:
 def update_record(record_id: str, parsed: dict) -> None:
     fields = {
         F_DESCRIPTION: parsed.get("description", ""),
-        F_PROMPT_TEXT: parsed.get("prompt_text", ""),
         F_CODE_HTML: parsed.get("code_html", ""),
     }
     status, payload = http(

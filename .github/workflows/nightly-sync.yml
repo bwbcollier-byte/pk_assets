@@ -35,7 +35,7 @@ jobs:
       - name: Detect new components
         id: detect
         run: |
-          python pipeline/detect_new_components.py | tee detect.log
+          python pipeline/detect_new_components.py --update-prompts | tee detect.log
 
       - name: Push source code to Airtable
         id: push

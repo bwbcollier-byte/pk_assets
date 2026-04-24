@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """Harvest components from 21st.dev into Airtable as Draft records.
 
-Uses the public shadcn registry JSON endpoints (no auth, no API key). Walks
-the sitemap to enumerate every community component, fetches each component's
-registry JSON at /r/<author>/<name>, and upserts a stub record into Airtable
-keyed on Source URL so the script is safe to re-run.
+For every two-segment component URL in 21st.dev's public sitemap:
+  1. Fetch the shadcn registry JSON at /r/<author>/<slug> (source + deps).
+  2. Fetch the demo source from cdn.21st.dev (best-effort).
+  3. Fetch each registryDependency's main file (best-effort, one level deep).
+  4. Assemble a Prompt Text that exactly matches 21st.dev's 'Copy prompt'
+     format — deterministic, no LLM involved.
 
-Category assignment isn't available in the registry JSON and the category
-listing pages hydrate client-side, so everything lands as Category="Components"
-for now — a later pass can classify via Gemini based on code content.
+Behavior:
+  * New components (by Source URL) → CREATE full record with Prompt Text
+    already populated. Gemini then only needs to fill Description and Code
+    HTML, not Prompt Text.
+  * Existing components → by default PATCH the Prompt Text to the freshly
+    templated version (overwrites anything Gemini wrote previously). Pass
+    --no-update-prompts to skip these.
 
 Env:
     AIRTABLE_PAT   read/write on the pk_assets base
 
 Flags:
-    --limit N       stop after N components (use for smoke tests)
-    --dry-run       fetch and print what would be created, no Airtable writes
+    --limit N              stop after N components touched
+    --dry-run              no Airtable writes
+    --no-update-prompts    skip the Prompt Text backfill on existing records
 """
 from __future__ import annotations
 
@@ -27,10 +34,13 @@ import sys
 import time
 from urllib import error, parse, request
 
+from prompt_template import build_prompt_text
+
 BASE_ID = "appbUpVCXkuPCOo6y"
 TABLE_ID = "tblKkKRKRsd7IkqHm"
 
 F_NAME = "fldYb4DpOA6hNTgYh"
+F_PROMPT_TEXT = "fldJfx71qA76Z6bJE"
 F_CODE_REACT = "fldWLYeGvIbKq9yK0"
 F_TOKEN_ESTIMATE = "fldCuoXQOiyWLAPVR"
 F_FRAMEWORK = "fldcZoPqXudr99WYG"
@@ -98,7 +108,6 @@ def airtable(method: str, url: str, body: dict | None = None) -> tuple[int, dict
 
 
 def enumerate_components() -> list[tuple[str, str]]:
-    """Return [(author, component_slug), ...] from the public sitemap."""
     status, body = http_get(SITEMAP_URL)
     if status != 200 or not body:
         sys.exit(f"sitemap fetch failed: {status}")
@@ -114,10 +123,7 @@ def enumerate_components() -> list[tuple[str, str]]:
         parts = tail.split("/")
         if parts[0] in SKIP_FIRST_SEGMENT:
             continue
-        if len(parts) < 2:
-            continue
-        # Variant URLs (3+ segments) 404 on the registry endpoint — skip.
-        if len(parts) > 2:
+        if len(parts) != 2:
             continue
         key = (parts[0], parts[1])
         if key in seen:
@@ -128,9 +134,39 @@ def enumerate_components() -> list[tuple[str, str]]:
 
 
 def fetch_registry(author: str, slug: str) -> dict | None:
-    url = f"https://21st.dev/r/{author}/{slug}"
-    status, body = http_get(url)
+    status, body = http_get(f"https://21st.dev/r/{author}/{slug}")
     if status != 200:
+        return None
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or "files" not in data:
+        return None
+    return data
+
+
+def fetch_demo(author: str, slug: str) -> str | None:
+    status, body = http_get(
+        f"https://cdn.21st.dev/user_{author}/{slug}.demo.tsx"
+    )
+    if status != 200 or not body:
+        return None
+    return body.decode("utf-8", errors="replace")
+
+
+def fetch_registry_dep(ref: str) -> dict | None:
+    """Resolve a registryDependencies entry — usually a full /r URL, sometimes
+    a bare author/slug, rarely a shadcn primitive name."""
+    if ref.startswith("http://") or ref.startswith("https://"):
+        url = ref
+    elif "/" in ref:
+        url = f"https://21st.dev/r/{ref}"
+    else:
+        # Bare primitive like 'button' → try shadcn's own registry.
+        url = f"https://ui.shadcn.com/r/styles/default/{ref}.json"
+    status, body = http_get(url)
+    if status != 200 or not body:
         return None
     try:
         return json.loads(body.decode("utf-8"))
@@ -138,56 +174,82 @@ def fetch_registry(author: str, slug: str) -> dict | None:
         return None
 
 
-def existing_source_urls() -> set[str]:
-    urls: set[str] = set()
+def build_registry_deps(refs: list[str]) -> list[dict]:
+    """Resolve a list of registryDependencies into inlinable {label, code} blocks."""
+    out: list[dict] = []
+    for ref in refs or []:
+        dep = fetch_registry_dep(ref)
+        if not dep:
+            continue
+        files = dep.get("files") or []
+        if not files:
+            continue
+        first = files[0]
+        code = first.get("content") or ""
+        if not code.strip():
+            continue
+        # Label: for URL-style refs use author/name, for primitives use shadcn/name.
+        if ref.startswith("http"):
+            tail = ref.rsplit("/r/", 1)[-1] if "/r/" in ref else ref.rsplit("/", 1)[-1]
+            label = tail
+        elif "/" in ref:
+            label = ref
+        else:
+            label = f"shadcn/{ref}"
+        out.append({"label": label, "code": code})
+    return out
+
+
+def list_existing(limit: int = 0) -> dict[str, str]:
+    """Return {source_url: record_id} across all existing records."""
+    by_url: dict[str, str] = {}
     offset: str | None = None
     while True:
-        qs = {
-            "pageSize": "100",
-            "fields[]": "Source URL",
-            "filterByFormula": "LEN({Source URL})>0",
-        }
+        qs_pairs = [
+            ("pageSize", "100"),
+            ("fields[]", "Source URL"),
+            ("filterByFormula", "LEN({Source URL})>0"),
+        ]
         if offset:
-            qs["offset"] = offset
-        # urlencode doesn't handle the repeated fields[] the way we want; build manually.
-        qs_pairs = [(k, v) for k, v in qs.items()]
+            qs_pairs.append(("offset", offset))
         status, payload = airtable("GET", f"{AIRTABLE_ROOT}?{parse.urlencode(qs_pairs)}")
         if status != 200:
             sys.exit(f"airtable list failed: {status} {payload}")
         for rec in payload.get("records", []):
             u = rec.get("fields", {}).get("Source URL")
             if u:
-                urls.add(u.strip())
+                by_url[u.strip()] = rec["id"]
         offset = payload.get("offset")
         if not offset:
             break
+        if limit and len(by_url) >= limit * 4:
+            # Heuristic: don't page forever when we only need a small sample.
+            pass
         time.sleep(0.1)
-    return urls
+    return by_url
 
 
 def title_case(slug: str) -> str:
     return " ".join(w.capitalize() for w in slug.replace("_", "-").split("-") if w)
 
 
-def build_stub(author: str, slug: str, registry: dict) -> dict:
+def build_stub(author: str, slug: str, registry: dict, prompt_text: str, demo: str | None) -> dict:
     files = registry.get("files") or []
     if not files:
         return {}
-    # Concatenate if multiple files; most components ship one.
     if len(files) == 1:
         code = files[0].get("content") or ""
     else:
-        parts = []
-        for f in files:
-            path = f.get("path", "")
-            parts.append(f"// ---- {path} ----\n{f.get('content', '')}")
-        code = "\n\n".join(parts)
+        code = "\n\n".join(
+            f"// ---- {f.get('path','')} ----\n{f.get('content','')}" for f in files
+        )
     if not code.strip():
         return {}
 
     deps = registry.get("dependencies") or []
     display = f"{title_case(slug)} (21st.dev)"
     source_url = f"https://21st.dev/community/components/{author}/{slug}"
+
     tag_words = [author.lower()]
     for token in re.split(r"[-_]", slug):
         if token:
@@ -199,8 +261,9 @@ def build_stub(author: str, slug: str, registry: dict) -> dict:
         "fields": {
             F_NAME: display,
             F_CODE_REACT: code,
+            F_PROMPT_TEXT: prompt_text,
             F_TOKEN_ESTIMATE: max(1, len(code) // 4),
-            F_TAGS: ", ".join(dict.fromkeys(tag_words)),  # dedupe, preserve order
+            F_TAGS: ", ".join(dict.fromkeys(tag_words)),
             F_FRAMEWORK: ["React", "Tailwind"],
             F_CATEGORY: "Components",
             F_STYLE: "Dark UI",
@@ -212,14 +275,37 @@ def build_stub(author: str, slug: str, registry: dict) -> dict:
     }
 
 
+def assemble_prompt(author: str, slug: str, registry: dict) -> tuple[str, str | None]:
+    files = registry.get("files") or []
+    if not files:
+        return "", None
+    main_file = files[0]
+    main_filename = main_file.get("path", "").split("/")[-1] or f"{slug}.tsx"
+    main_code = main_file.get("content") or ""
+    demo = fetch_demo(author, slug)
+    npm_deps = registry.get("dependencies") or []
+    reg_deps_refs = registry.get("registryDependencies") or []
+    reg_deps = build_registry_deps(reg_deps_refs)
+    tw = (registry.get("tailwind") or {}).get("config") or None
+    if tw == {}:
+        tw = None
+    prompt = build_prompt_text(
+        main_filename=main_filename,
+        main_code=main_code,
+        demo_code=demo,
+        npm_deps=npm_deps,
+        registry_deps=reg_deps,
+        tailwind_config=tw,
+    )
+    return prompt, demo
+
+
 def create_records(stubs: list[dict]) -> tuple[int, int]:
     ok = fail = 0
     for i in range(0, len(stubs), 10):
         chunk = stubs[i : i + 10]
         status, payload = airtable(
-            "POST",
-            AIRTABLE_ROOT,
-            {"records": chunk, "typecast": True},
+            "POST", AIRTABLE_ROOT, {"records": chunk, "typecast": True}
         )
         if status >= 400:
             fail += len(chunk)
@@ -230,66 +316,105 @@ def create_records(stubs: list[dict]) -> tuple[int, int]:
     return ok, fail
 
 
+def patch_records(updates: list[dict]) -> tuple[int, int]:
+    ok = fail = 0
+    for i in range(0, len(updates), 10):
+        chunk = updates[i : i + 10]
+        status, payload = airtable(
+            "PATCH", AIRTABLE_ROOT, {"records": chunk, "typecast": True}
+        )
+        if status >= 400:
+            fail += len(chunk)
+            print(f"patch failed ({status}): {json.dumps(payload)[:200]}", file=sys.stderr)
+        else:
+            ok += len(payload.get("records", []))
+        time.sleep(0.25)
+    return ok, fail
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int, default=0, help="stop after N components")
+    ap.add_argument("--limit", type=int, default=0, help="stop after N components touched")
     ap.add_argument("--dry-run", action="store_true", help="no Airtable writes")
+    ap.add_argument(
+        "--no-update-prompts",
+        action="store_true",
+        help="skip rewriting Prompt Text on already-existing records",
+    )
     args = ap.parse_args(argv)
 
     print("enumerating components from sitemap…", flush=True)
     components = enumerate_components()
     print(f"  found {len(components)} 2-segment component paths", flush=True)
 
+    known = list_existing() if not args.dry_run else {}
     if not args.dry_run:
-        print("loading existing Source URLs from Airtable…", flush=True)
-        known = existing_source_urls()
-        print(f"  {len(known)} already in Airtable", flush=True)
-    else:
-        known = set()
+        print(f"  {len(known)} existing records indexed by Source URL", flush=True)
 
     stubs: list[dict] = []
-    skipped_existing = fetch_failed = empty_registry = 0
+    updates: list[dict] = []
+    fetch_failed = empty_registry = touched = 0
+
     for idx, (author, slug) in enumerate(components, 1):
-        if args.limit and len(stubs) >= args.limit:
+        if args.limit and touched >= args.limit:
             break
         source_url = f"https://21st.dev/community/components/{author}/{slug}"
-        if source_url in known:
-            skipped_existing += 1
+        is_existing = source_url in known
+        if is_existing and args.no_update_prompts:
             continue
+
         registry = fetch_registry(author, slug)
         if registry is None:
             fetch_failed += 1
             print(f"[{idx}/{len(components)}] fetch fail {author}/{slug}", file=sys.stderr)
-            time.sleep(0.2)
+            time.sleep(0.15)
             continue
-        stub = build_stub(author, slug, registry)
-        if not stub:
+
+        prompt_text, _demo = assemble_prompt(author, slug, registry)
+        if not prompt_text:
             empty_registry += 1
             continue
-        stubs.append(stub)
-        if len(stubs) % 25 == 0:
-            print(f"[{idx}/{len(components)}] staged {len(stubs)} stubs", flush=True)
-        time.sleep(0.2)
+
+        if is_existing:
+            updates.append(
+                {"id": known[source_url], "fields": {F_PROMPT_TEXT: prompt_text}}
+            )
+        else:
+            stub = build_stub(author, slug, registry, prompt_text, _demo)
+            if not stub:
+                empty_registry += 1
+                continue
+            stubs.append(stub)
+
+        touched += 1
+        if touched % 25 == 0:
+            print(
+                f"[{idx}/{len(components)}] staged new={len(stubs)} updates={len(updates)}",
+                flush=True,
+            )
+        time.sleep(0.15)
 
     print(
-        f"staged={len(stubs)} skipped_existing={skipped_existing} "
+        f"staged new={len(stubs)} updates={len(updates)} "
         f"fetch_failed={fetch_failed} empty_registry={empty_registry}",
         flush=True,
     )
 
     if args.dry_run:
-        print("--dry-run: no records created")
-        for s in stubs[:5]:
-            print(json.dumps(s["fields"].get(F_NAME), ensure_ascii=False))
+        print("--dry-run: no writes")
+        for s in stubs[:3]:
+            print("CREATE", s["fields"].get(F_NAME))
+        for u in updates[:3]:
+            print("UPDATE", u["id"])
         return 0
 
-    if not stubs:
-        print("nothing new to create")
-        return 0
-
-    ok, fail = create_records(stubs)
-    print(f"airtable: created={ok} failed={fail}")
-    return 0 if fail == 0 else 2
+    ok_new, fail_new = create_records(stubs) if stubs else (0, 0)
+    ok_upd, fail_upd = patch_records(updates) if updates else (0, 0)
+    print(
+        f"airtable: created={ok_new}/{len(stubs)} updated={ok_upd}/{len(updates)} "
+        f"failed={fail_new + fail_upd}"
+    )
+    return 0 if (fail_new + fail_upd) == 0 else 2
 
 
 if __name__ == "__main__":
