@@ -198,8 +198,18 @@ def call_gemini(key: str, code: str, name: str) -> dict:
         ],
         "generationConfig": {
             "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "prompt_text": {"type": "string"},
+                    "code_html": {"type": "string"},
+                },
+                "required": ["description", "prompt_text", "code_html"],
+                "propertyOrdering": ["description", "prompt_text", "code_html"],
+            },
             "temperature": 0.4,
-            "maxOutputTokens": 8192,
+            "maxOutputTokens": 16384,
         },
     }
     status, payload = http("POST", url, {}, body)
