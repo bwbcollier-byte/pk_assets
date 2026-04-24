@@ -1,0 +1,6 @@
+name = "pk-preview"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# AIRTABLE_PAT is set as a secret via:
+#   wrangler secret put AIRTABLE_PAT
