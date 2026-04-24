@@ -11,7 +11,6 @@ jobs:
     timeout-minutes: 30
     env:
       AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,10 +36,18 @@ jobs:
         run: |
           python pipeline/push_code_to_airtable.py | tee push.log
 
-      - name: Generate marketplace copy (realtime)
+      - name: Generate marketplace copy (Gemini + OpenRouter fallback)
         id: generate
         run: |
           python pipeline/generate_fields_batch.py realtime | tee generate.log
+
+      - name: Upload generation log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generation-log
+          path: generation_log.jsonl
+          if-no-files-found: ignore
 
       - name: Summary
         if: always()

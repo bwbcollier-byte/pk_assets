@@ -2,7 +2,8 @@
 
 Automation pipeline for a UI component asset library stored in Airtable.
 Syncs source code from open-source component repos into Airtable and uses
-Claude Haiku to generate marketplace descriptions, prompts, and HTML.
+free-tier Gemini 2.5 Flash (with OpenRouter free-model fallback) to generate
+marketplace descriptions, prompts, and HTML.
 
 See [`pipeline/README.md`](pipeline/README.md) for architecture, cost, and
 what still needs human judgment.
@@ -10,8 +11,7 @@ what still needs human judgment.
 ## Quick start
 
 ```bash
-export AIRTABLE_PAT=pat_...
-export ANTHROPIC_API_KEY=sk-ant-...
+export AIRTABLE_PAT=pat_...   # scopes: read on Logins & Keys base, read/write on pk_assets base
 
 mkdir -p repos
 git clone --depth 1 https://github.com/magicuidesign/magicui.git repos/magicui
@@ -19,11 +19,10 @@ git clone --depth 1 https://github.com/markmead/hyperui.git repos/hyperui
 
 python pipeline/detect_new_components.py
 python pipeline/push_code_to_airtable.py
-python pipeline/generate_fields_batch.py batch batch_requests.jsonl
-# submit to Anthropic Message Batches API, then:
-python pipeline/generate_fields_batch.py apply results.jsonl
+python pipeline/generate_fields_batch.py
 ```
 
-A nightly GitHub Actions workflow (`.github/workflows/nightly-sync.yml`) runs
-the same steps at 3 AM UTC using the `AIRTABLE_PAT` and `ANTHROPIC_API_KEY`
-repo secrets.
+Gemini and OpenRouter keys are fetched from Airtable at runtime, so only a
+single `AIRTABLE_PAT` needs to be configured as a GitHub secret. A nightly
+workflow at `.github/workflows/nightly-sync.yml` runs the three scripts at
+3 AM UTC.

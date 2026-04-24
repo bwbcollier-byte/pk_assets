@@ -41,14 +41,15 @@ upstream repos ──clone──▶ repos/<library>/...
 |---|---|
 | `detect_new_components.py` | Walks `repos/` and creates Airtable stubs for components that don't exist yet. Sets defaults: Framework `[React, Tailwind]`, Category `Components`, Style `Dark UI`, Tier `Free`, Published `Draft`, Source `Scraped`, Source URL, and Tags from the filename. |
 | `push_code_to_airtable.py` | Reads source files under `repos/` and patches `Code React` + `Token Estimate` on matching records. Skips records that already have code. Matching is kebab-case filename → `Title Case (Library Name)` in Airtable, with a short override list for ambiguous cases. |
-| `generate_fields_batch.py` | For records with code but thin copy, asks Claude Haiku (`claude-haiku-4-5-20251001`) for a JSON blob with `description`, `prompt_text`, and `code_html`. Supports `realtime` (sync, ~$0.006/component) and `batch` (writes JSONL for the Message Batches API, 50% cheaper). Also has an `apply <results.jsonl>` mode for writing batch results back to Airtable. |
+| `generate_fields_batch.py` | For records with code but thin copy, asks **Gemini 2.5 Flash** (free tier) for a JSON blob with `description`, `prompt_text`, and `code_html`. Falls back to **OpenRouter free models** (default `meta-llama/llama-3.3-70b-instruct:free`) when Gemini keys are exhausted. Both providers use key pools rotated round-robin per request, pulled from the Airtable Logins & Keys base at runtime so upstream key rotations don't require a redeploy. Supports `realtime` (default) and `apply <results.jsonl>` (re-patch Airtable from a saved log). |
 
 ## Setup
 
 ```bash
-# Env
-export AIRTABLE_PAT=pat_...        # scope: data.records:read, data.records:write
-export ANTHROPIC_API_KEY=sk-ant-...
+# Env — only one secret needed. The PAT must have:
+#   read/write on the pk_assets base     (appbUpVCXkuPCOo6y)
+#   read on the Logins & Keys base       (app6biS7yjV6XzFVG)
+export AIRTABLE_PAT=pat_...
 
 # Clone upstream component repos (the pipeline reads from these paths)
 mkdir -p repos
@@ -58,21 +59,27 @@ git clone --depth 1 https://github.com/markmead/hyperui.git repos/hyperui
 
 Airtable config is hard-coded at the top of each script:
 
-- Base `appbUpVCXkuPCOo6y`
-- Table `tblKkKRKRsd7IkqHm`
+- pk_assets base `appbUpVCXkuPCOo6y`, table `tblKkKRKRsd7IkqHm`
+- Logins & Keys base `app6biS7yjV6XzFVG`, table `tbldJkG11gY1W3jTf`
+  - Gemini keys record `rec5AHCBuv5uOxAv7` (parsed from the Keys field by `AIza…` prefix)
+  - OpenRouter keys record `recWh4W2XOf2TfZAn` (parsed by `sk-or-v1-…` prefix)
+
+Override the OpenRouter fallback model with `OPENROUTER_MODEL=...:free`.
 
 ## Run order
 
 ```bash
-python pipeline/detect_new_components.py       # create stubs for new files
-python pipeline/push_code_to_airtable.py       # fill in source code
-python pipeline/generate_fields_batch.py batch batch_requests.jsonl
-# submit batch_requests.jsonl via Anthropic Message Batches API, then:
-python pipeline/generate_fields_batch.py apply results.jsonl
+python pipeline/detect_new_components.py   # create stubs for new files
+python pipeline/push_code_to_airtable.py   # fill in source code
+python pipeline/generate_fields_batch.py   # Gemini → OpenRouter fallback
 ```
 
-For ad-hoc runs, `generate_fields_batch.py realtime` will stream updates one
-record at a time.
+Each generation appends to `generation_log.jsonl`. To re-patch Airtable from
+that log (e.g., after manual edits to a failed entry):
+
+```bash
+python pipeline/generate_fields_batch.py apply generation_log.jsonl
+```
 
 ## Cost
 
@@ -80,11 +87,17 @@ record at a time.
 |---|---|
 | `detect_new_components.py` | $0 |
 | `push_code_to_airtable.py` | $0 |
-| `generate_fields_batch.py` (realtime, 368 components) | ~$2.20 |
-| `generate_fields_batch.py` (batch mode, 368 components) | ~$1.10 |
+| `generate_fields_batch.py` (Gemini free + OpenRouter free) | $0 |
 
-Batch mode is strongly preferred — same output, half the price, no rate-limit
-hand-wringing.
+Throughput: Gemini's free tier is ~15 RPM per key. With 7 keys rotated
+round-robin, that's ~105 RPM — 368 components finish in ~4 minutes. If a key
+hits HTTP 401/403 it's pulled from the pool for the run; OpenRouter keys take
+over once all Gemini keys are out.
+
+The trade-off versus paid Claude Haiku: copy quality is lower and JSON output
+is a bit flakier. The pipeline retries once via OpenRouter on a parse error;
+anything that still fails lands in `generation_log.jsonl` for human review or
+for a Claude Code pass later.
 
 ## Repo coverage
 
