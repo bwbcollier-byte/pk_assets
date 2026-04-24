@@ -58,7 +58,7 @@ OPENROUTER_RECORD_ID = "recWh4W2XOf2TfZAn"
 
 GEMINI_MODEL = "gemini-2.5-flash"
 OPENROUTER_MODEL = os.environ.get(
-    "OPENROUTER_MODEL", "deepseek/deepseek-chat-v3.1:free"
+    "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
 )
 
 SYSTEM_PROMPT = """You generate marketplace assets for a UI component library.
